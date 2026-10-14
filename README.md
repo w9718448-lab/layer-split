@@ -3,7 +3,7 @@
 把一整张画好的插画（造景贴纸、室内/室外场景）拆成分层素材：
 
 - 每个元素一张透明底 PNG，文件名是 `编号_名称.png`，编号按 Z 字形从左上到右下
-- 被挡住的部分补完整（优先用宿主 AI 自带的生图模型，没有时用本地 LaMa 兜底）
+- 被挡住的部分补完整（宿主 AI 自带的生图模型、脚本直接调生图 API（Gemini / OpenAI / fal），或本地 LaMa 兜底）
 - 一个分层 PSD：最上 `完整预览`，中间 `元素/` 文件夹（每个元素一个图层），最下 `背景`（去掉所有元素后的底）
 
 完整说明见 [SKILL.md](SKILL.md)。
@@ -16,7 +16,7 @@ pip install -r layer-split/requirements.txt
 # 没有生图模型、需要本地补全时再装：pip install torch
 ```
 
-模型（SAM、Real-ESRGAN、LaMa）第一次运行时自动下载，也可以放到环境变量 `LAYER_SPLIT_MODELS` 指定的目录。
+模型（SAM、Real-ESRGAN、LaMa，以及加 `--refine` 时的 BiRefNet）第一次运行时自动下载，也可以放到环境变量 `LAYER_SPLIT_MODELS` 指定的目录。
 
 ### 在不同 AI 环境里用
 
@@ -39,6 +39,10 @@ python3 -I scripts/split_layers.py 原图.png --out out --mode boxes --boxes box
 python3 -I scripts/complete.py prepare 原图.png --run out
 python3 -I scripts/complete.py apply   原图.png --run out --gen 生成结果目录
 python3 -I scripts/complete.py lama    原图.png --run out
+# 2' 或者让脚本直接调生图 API，一条命令补完（Key 放环境变量 GEMINI_API_KEY / OPENAI_API_KEY / FAL_KEY）
+python3 -I scripts/complete.py api     原图.png --run out --backend gemini
+# 可选：拆分时用 BiRefNet 精修边缘
+python3 -I scripts/split_layers.py 原图.png --out out --mode boxes --boxes boxes.json --refine birefnet-lite
 # 3 出 PSD
 python3 -I scripts/build_psd.py 原图.png --run out --out 结果.psd
 ```
