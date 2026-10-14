@@ -898,7 +898,11 @@ def main():
             jobs.append((name, bx, None, {"points": d.get("points"), "neg": d.get("neg")}))
 
     if args.estimate:
-        print(json.dumps(estimate(len(jobs), args), ensure_ascii=False, indent=1))
+        est = estimate(len(jobs), args)
+        # 前两行就是给用户看的原话，后面是给 AI 用的详细数据
+        for i, o in enumerate(est["options"], start=1):
+            print(f"{i}. {o['name']}版：{o['time']}，共 {est['elements']} 个元素")
+        print(json.dumps(est, ensure_ascii=False))
         return
 
     sam = None
