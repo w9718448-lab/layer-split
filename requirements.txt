@@ -1,0 +1,6 @@
+onnxruntime
+pillow
+numpy
+scipy
+opencv-python-headless
+psd-tools
