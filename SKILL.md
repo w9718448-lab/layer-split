@@ -34,6 +34,7 @@ pip install --break-system-packages onnxruntime pillow numpy scipy opencv-python
 - SAM `vit_b-encoder-quant` + `vit_b-decoder-quant`（约 108MB），分割
 - Real-ESRGAN ncnn `realesr-animevideov3`（约 47MB），元素放大变清晰。没有显卡要装 `mesa-vulkan-drivers`，不可用时自动退回普通放大
 - 只有宿主没有生图模型时才需要：`torch` + `big-lama.pt`（约 200MB），本地补全兜底
+- 只有加 `--refine` 时才需要：BiRefNet（`birefnet-lite` 约 220MB，`birefnet` 约 970MB），边缘精修
 
 不要装 rembg（依赖 numba，会卡住）。所有脚本用 `python3 -I` 运行。
 
@@ -53,10 +54,28 @@ python3 -I scripts/grid_overlay.py 原图.png grid.png --step 50 --region x0,y0,
 `points` 是落在目标上的正点，`neg` 是落在不要的东西上的负点（原图坐标），用来纠正选错、粘连。名称不要重复。
 
 ### 2. 拆分（元素多时放后台跑）
+
+**先让用户选拆法，再正式拆。** 框列好后先估算耗时：
 ```
-nohup python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json > run.log 2>&1 &
+python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json --estimate
+```
+输出的前两行就是要发给用户的原话，原样发出，等用户回复选哪个：
+```
+1. 标准版：约 14 分钟，共 108 个元素
+2. 精修版：约 68 分钟，共 108 个元素
+```
+用户问区别时再解释：标准版速度快，平涂插画的轮廓外可能带 1 像素左右的浅色毛边；
+精修版（`--refine birefnet-lite`）毛边和底色光晕更少，每个元素多约 30 秒，内存约 7GB。
+估算按无显卡的 CPU 计（`note` 会说明是否检测到显卡），是上限。用户已经说过要哪种的，直接按那种拆，不用再问。
+
+然后按选的拆：
+```
+nohup python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json [--refine birefnet-lite] > run.log 2>&1 &
 ```
 看 `review_these.png` 和 `sheet_elements_N.png`，选错的元素加 `neg`/`points` 重跑；只剩碎片的元素删掉。
+用户选了精修时，可以先用标准（或 `--no-hires`）快速拆一遍确认框都对，再加 `--refine` 正式拆，免得精修跑完才发现框错了。
+精修只重新判定 SAM 掩码边缘一圈的像素，内部和框外不动；BiRefNet 认不出这个元素时自动退回 SAM 结果
+（`manifest.json` 里 `quality.refined` 记录是否精修过）。
 背景简单、元素分得开的图（纯色或渐变底）可以直接 `--mode auto`，不用列框。
 
 ### 3. 补全（必做）
@@ -74,7 +93,20 @@ python3 -I scripts/complete.py prepare 原图.png --run 输出目录
 ```
 python3 -I scripts/complete.py apply 原图.png --run 输出目录 --gen 生成结果目录
 ```
-**没有生图模型时**用本地 LaMa 兜底（只补得好小缺口，大块缺失会糊）：
+**宿主没有生图模型、或者要整批无人值守跑时**，让脚本直接调生图 API（Key 放环境变量）：
+```
+GEMINI_API_KEY=... python3 -I scripts/complete.py api 原图.png --run 输出目录 --backend gemini
+```
+一条命令做完 prepare → 生成 → apply。`--backend` 可选：
+- `gemini`：Gemini 图像模型，默认 `gemini-nano-banana-2.1`，`GEMINI_API_KEY`
+- `openai`：gpt-image 图像编辑（原生支持蒙版），默认 `gpt-image-2`，`OPENAI_API_KEY`
+- `fal`：fal.ai 局部重绘，默认 `fal-ai/flux-pro/v1/fill`，`FAL_KEY`
+
+`--model` 换模型，`--workers` 设并发（默认 4）。结果存在 `输出目录/completion/gen/`，已有的结果会跳过，
+中途失败重跑同一条命令只补没生成的。也可以只跑生成这一步：`python3 -I scripts/gen_api.py 输出目录 --backend gemini`，
+再用上面的 `apply --gen 输出目录/completion/gen` 合并。
+
+**都没有时**用本地 LaMa 兜底（只补得好小缺口，大块缺失会糊）：
 ```
 python3 -I scripts/complete.py lama 原图.png --run 输出目录
 ```
@@ -105,6 +137,9 @@ python3 -I scripts/build_psd.py 原图.png --run 输出目录 --out 结果.psd
 | `split_layers.py --no-hires` | 关 | 整图只编码一次，快很多，边缘稍粗，用于预览 |
 | `split_layers.py --no-exclusive` | 关 | 不做像素归属（默认重叠像素归更小的元素） |
 | `split_layers.py --sticker` | 关 | 额外出白边贴纸版，用户明确要才加 |
+| `split_layers.py --refine` | none | `birefnet-lite` / `birefnet`：用 BiRefNet 精修边缘 |
+| `split_layers.py --estimate` | 关 | 不拆，只估算标准 / 精修两种拆法的耗时 |
+| `complete.py api --backend` | — | `gemini` / `openai` / `fal`：脚本直接调生图 API 补全 |
 | `complete.py --pack` | 4 | 几个元素拼一张图交给生图模型 |
 | `complete.py --min-hole` | 0.03 | 缺口占比低于此值不补 |
 | `build_psd.py --scale` | 元素倍数 | PSD 画布相对原图的倍数 |
@@ -114,6 +149,7 @@ python3 -I scripts/build_psd.py 原图.png --run 输出目录 --out 结果.psd
 
 - 拆分：每个元素约 6 秒（200 个约 25 分钟），超分每个约 1.5 秒
 - LaMa 兜底补全：每个元素约 1 秒，背景约 1 分钟
+- `--refine birefnet-lite`：每个元素多约 30 秒（BiRefNet 固定按 1024 输入推理）
 - PSD：200 层约 1 分钟，2 倍画布约 50MB
 
 ## 已知限制

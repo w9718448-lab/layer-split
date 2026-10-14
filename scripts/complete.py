@@ -15,6 +15,8 @@
       生成结果目录里放 <编号>_<名称>.png（与 input.png 同尺寸，纯白底或透明底均可）
   python complete.py lama 原图.png --run 拆分输出目录
       不用外部生图，直接用本地 LaMa 补（等于 prepare + 本地生成 + apply）
+  python complete.py api 原图.png --run 拆分输出目录 --backend gemini|openai|fal
+      脚本自己调生图 API 补（等于 prepare + gen_api.py + apply），可整批无人值守，详见 gen_api.py
 
 补全前的元素会保留在 <run>/elements_original/，PSD 排序时要用。
 """
@@ -329,7 +331,7 @@ def lama_gen(img, it, m, t):
 
 def main():
     ap = argparse.ArgumentParser(description="补全被遮挡的元素")
-    ap.add_argument("cmd", choices=["prepare", "apply", "lama"])
+    ap.add_argument("cmd", choices=["prepare", "apply", "lama", "api"])
     ap.add_argument("image")
     ap.add_argument("--run", required=True)
     ap.add_argument("--gen", help="apply：生成结果目录")
@@ -337,10 +339,25 @@ def main():
                     help="prepare：几个元素拼成一张图交给生图模型，默认 4（调用次数减为约 1/4），1 表示不拼")
     ap.add_argument("--min-hole", type=float, default=0.03,
                     help="prepare：缺口面积占元素面积低于这个比例的不补，默认 0.03")
+    ap.add_argument("--backend", choices=["gemini", "openai", "fal"], help="api：生图 API 后端")
+    ap.add_argument("--model", help="api：模型名，不填用 gen_api.py 里的默认值")
+    ap.add_argument("--workers", type=int, default=4, help="api：并发请求数")
     args = ap.parse_args()
     if args.cmd == "prepare":
         prepare(args)
     elif args.cmd == "apply":
+        apply(args)
+    elif args.cmd == "api":
+        import gen_api
+        if not args.backend:
+            sys.exit("api 需要 --backend")
+        if not os.path.exists(os.path.join(args.run, "completion", "tasks.json")):
+            prepare(args)
+        args.gen = args.gen or os.path.join(args.run, "completion", "gen")
+        res = gen_api.run_all(args.run, args.backend, args.model, args.gen, args.workers)
+        if res["failed"]:
+            print(f"{len(res['failed'])} 张生成失败，先合并已有结果；重跑同一命令会只补失败的",
+                  file=sys.stderr)
         apply(args)
     else:
         if not os.path.exists(os.path.join(args.run, "completion", "tasks.json")):

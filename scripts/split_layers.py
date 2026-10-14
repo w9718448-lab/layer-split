@@ -28,6 +28,14 @@ MODEL_CFG = {
     # name: (input size, mean, std)
     "isnet-general-use": (1024, (0.5, 0.5, 0.5), (1.0, 1.0, 1.0)),
     "u2net": (320, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    # BiRefNet：边缘（细线、毛边、发丝）比 isnet 准，输出是 logits，要过 sigmoid
+    "BiRefNet-general-epoch_244": (1024, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    "BiRefNet-general-bb_swin_v1_tiny-epoch_232": (1024, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+}
+# --refine 的简写 -> 模型文件名
+REFINE_MODELS = {
+    "birefnet": "BiRefNet-general-epoch_244",                     # 约 970MB，CPU 每次约十几秒
+    "birefnet-lite": "BiRefNet-general-bb_swin_v1_tiny-epoch_232",  # 约 220MB，快很多
 }
 MODEL_DIRS = [
     os.environ.get("LAYER_SPLIT_MODELS", ""),
@@ -55,7 +63,14 @@ def get_session(name):
         path = os.path.join(d, name + ".onnx")
         print(f"下载模型 {name} ...", file=sys.stderr)
         urllib.request.urlretrieve(MODEL_URL.format(name), path)
-    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    opts = ort.SessionOptions()
+    if name.startswith("BiRefNet"):
+        # 默认的内存池会让 BiRefNet 第二次推理涨到 12GB 以上，关掉后稳定在 7GB 左右
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                 if p in ort.get_available_providers()]
+    sess = ort.InferenceSession(path, opts, providers=providers)
     _sessions[name] = sess
     return sess
 
@@ -70,7 +85,11 @@ def matte(img_rgb, model="isnet-general-use"):
     x = (x - np.array(mean, dtype=np.float32)) / np.array(std, dtype=np.float32)
     x = x.transpose(2, 0, 1)[None].astype(np.float32)
     out = sess.run(None, {sess.get_inputs()[0].name: x})[0][0, 0]
-    out = (out - out.min()) / max(float(out.max() - out.min()), 1e-6)
+    if model.startswith("BiRefNet"):
+        # 不做 min-max 拉伸：元素不显著时拉伸会把噪声放大成假前景
+        out = 1.0 / (1.0 + np.exp(-out))
+    else:
+        out = (out - out.min()) / max(float(out.max() - out.min()), 1e-6)
     m = Image.fromarray((out * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
     return np.asarray(m, dtype=np.float32) / 255.0
 
@@ -248,13 +267,14 @@ def _solidity(m):
     return float(m.sum() / hull) if hull > 0 else None
 
 
-def sam_extract(img, sam, box, extra=None, hires=True, snap=True, hole_ratio=0.03):
+def sam_extract(img, sam, box, extra=None, hires=True, snap=True, hole_ratio=0.03, refine=None):
     """用 SAM 在框内分割一个元素。
 
     1. hires：裁出框周围区域放大后单独编码
     2. 生成多组候选（框+中心点 / 只有框 / 框+沿长边两点），按“掩码外接框与用户框的吻合度 + 预测 IoU”择优
     3. 用上一轮掩码再迭代一次细化
     4. 补小洞、找回黑色描边、GrabCut 窄带吸附边缘、平滑
+    5. refine 给了模型名时，用 BiRefNet 重新判定边缘窄带（软边缘）
     返回 (RGBA, 原图中的 bbox, 质量指标)。
     """
     extra = extra or {}
@@ -337,6 +357,9 @@ def sam_extract(img, sam, box, extra=None, hires=True, snap=True, hole_ratio=0.0
     sm = _main_parts(sm, keep=0.08)   # 去掉连带进来的邻居碎片，元素只保留自己
     alpha = np.asarray(Image.fromarray((sm * 255).astype(np.uint8)).filter(
         ImageFilter.GaussianBlur(0.6)))
+    refined = refine_edges(crop, sm, refine) if refine else None
+    if refined is not None:
+        alpha = (refined * 255).astype(np.uint8)
 
     rgba = crop.convert("RGBA")
     rgba.putalpha(Image.fromarray(alpha))
@@ -347,10 +370,33 @@ def sam_extract(img, sam, box, extra=None, hires=True, snap=True, hole_ratio=0.0
     fb = _bbox_of(sm)
     q = {"box_iou": round(_box_iou(fb, ubox), 3), "pred_iou": round(ip, 3),
          "solidity": None}
+    if refine:
+        q["refined"] = refined is not None
     sol = _solidity(sm)
     if sol is not None:
         q["solidity"] = round(sol, 3)
     return el, (cx0 + ox, cy0 + oy, cx0 + ox + el.width, cy0 + oy + el.height), q
+
+
+def refine_edges(crop, m, model, band=None, agree=0.6):
+    """用 BiRefNet 重新判定 SAM 掩码边缘一圈的像素，返回 float alpha [0,1]；不可信时返回 None。
+
+    只动边缘窄带：内部保持 SAM 的实心结果，窄带外一律透明，所以 BiRefNet 看中邻居也带不进来。
+    裁切图里这个元素不够显著时（BiRefNet 在 SAM 掩码内的认同度低于 agree），放弃精修，用回 SAM。
+    """
+    if m.sum() < 64:
+        return None
+    prob = matte(crop, model)
+    if float((prob[m] > 0.5).mean()) < agree:
+        return None
+    h, w = m.shape
+    r = band or int(np.clip(round(0.015 * max(h, w)), 2, 6))
+    core = ndi.binary_erosion(m, iterations=r)
+    outer = ndi.binary_dilation(m, iterations=r)
+    alpha = np.where(core, 1.0, np.where(outer, prob, 0.0)).astype(np.float32)
+    keep = _main_parts(alpha > 0.5, keep=0.08)
+    keep = ndi.binary_dilation(keep, iterations=1)
+    return np.where(keep, alpha, 0.0).astype(np.float32)
 
 
 def estimate_bg(arr, thr=28):
@@ -750,6 +796,41 @@ def superres(els, scale):
     return res, method
 
 
+# 每个元素的耗时（秒），2 核/4 核 CPU 无显卡实测；有显卡时明显更快，按这个估算算上限
+SEC_SPLIT = 6.0      # SAM 分割
+SEC_SR = 1.5         # Real-ESRGAN 超分（--upscale > 1 时）
+SEC_REFINE = {"birefnet-lite": 30.0, "birefnet": 60.0}
+
+
+def _fmt_min(sec):
+    m = sec / 60
+    return f"约 {m:.0f} 分钟" if m >= 1.5 else "约 1 分钟"
+
+
+def estimate(n, args):
+    """估算两种拆法的耗时，供拆分前让用户选择。"""
+    try:
+        import onnxruntime as ort
+        gpu = "CUDAExecutionProvider" in ort.get_available_providers()
+    except ImportError:
+        gpu = False
+    base = n * (SEC_SPLIT + (SEC_SR if args.upscale > 1 else 0))
+    refine = "birefnet-lite"
+    fine = base + n * SEC_REFINE[refine]
+    note = "检测到显卡，实际会比估算快很多" if gpu else "没有显卡，按 CPU 估算"
+    return {
+        "elements": n, "gpu": gpu, "note": note,
+        "options": [
+            {"name": "标准", "args": "", "minutes": round(base / 60, 1), "time": _fmt_min(base),
+             "desc": "SAM 分割，速度快；平涂插画的轮廓外可能带 1 像素左右的浅色毛边"},
+            {"name": "精修", "args": f"--refine {refine}", "minutes": round(fine / 60, 1),
+             "time": _fmt_min(fine),
+             "desc": "在标准基础上用 BiRefNet 重新判定边缘一圈，毛边和底色光晕更少；"
+                     f"每个元素多约 {SEC_REFINE[refine]:.0f} 秒，内存需要约 7GB"},
+        ],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="图层拆分 / 造景贴纸")
     ap.add_argument("image")
@@ -771,6 +852,8 @@ def main():
                     help="boxes+sam：用 GrabCut 吸附边缘（实测在遮挡处会带进邻居颜色，默认关闭）")
     ap.add_argument("--upscale", type=int, default=2, choices=[1, 2, 3, 4],
                     help="元素放大倍数，用 Real-ESRGAN 把线稿变清晰，1 表示不放大（默认 2）")
+    ap.add_argument("--refine", choices=["none"] + list(REFINE_MODELS), default="none",
+                    help="boxes+sam：用 BiRefNet 精修元素边缘（细线、毛边更干净）。birefnet-lite 快，birefnet 更准")
     ap.add_argument("--model", default="isnet-general-use", choices=list(MODEL_CFG))
     ap.add_argument("--no-refine", action="store_true", help="auto：不用模型细化边缘")
     ap.add_argument("--sticker", action="store_true",
@@ -779,6 +862,8 @@ def main():
                     help="仅配合 --sticker：白边宽度(px)，0 表示自动（默认）")
     ap.add_argument("--min-size", type=int, default=24, help="输出元素的最小边长")
     ap.add_argument("--zip", action="store_true", help="结果打包成 <out>.zip")
+    ap.add_argument("--estimate", action="store_true",
+                    help="不拆，只估算“标准”和“精修”两种拆法的耗时，给用户选")
     args = ap.parse_args()
 
     img = Image.open(args.image)
@@ -812,6 +897,14 @@ def main():
                            if c.isalnum() or c in "-_ ").strip().replace(" ", "_") or f"item{i:03d}"
             jobs.append((name, bx, None, {"points": d.get("points"), "neg": d.get("neg")}))
 
+    if args.estimate:
+        est = estimate(len(jobs), args)
+        # 前两行就是给用户看的原话，后面是给 AI 用的详细数据
+        for i, o in enumerate(est["options"], start=1):
+            print(f"{i}. {o['name']}版：{o['time']}，共 {est['elements']} 个元素")
+        print(json.dumps(est, ensure_ascii=False))
+        return
+
     sam = None
     hires = not args.no_hires
     if args.mode == "boxes" and args.engine == "sam":
@@ -819,12 +912,15 @@ def main():
         if not hires:
             sam.set_image(img.convert("RGB"))
         info["engine"] = "sam" + ("" if hires else "(整图编码)")
+        if args.refine != "none":
+            info["refine"] = args.refine
 
     found = []   # (name, el, bbox, quality)
     for idx, (name, bb, grp, extra) in enumerate(jobs, start=1):
         q = None
         if sam is not None:
-            res = sam_extract(img, sam, bb, extra, hires=hires, snap=args.snap)
+            res = sam_extract(img, sam, bb, extra, hires=hires, snap=args.snap,
+                              refine=REFINE_MODELS.get(args.refine))
             if res is not None:
                 el, bbox, q = res
         else:
