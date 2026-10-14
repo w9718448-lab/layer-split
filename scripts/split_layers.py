@@ -796,6 +796,41 @@ def superres(els, scale):
     return res, method
 
 
+# 每个元素的耗时（秒），2 核/4 核 CPU 无显卡实测；有显卡时明显更快，按这个估算算上限
+SEC_SPLIT = 6.0      # SAM 分割
+SEC_SR = 1.5         # Real-ESRGAN 超分（--upscale > 1 时）
+SEC_REFINE = {"birefnet-lite": 30.0, "birefnet": 60.0}
+
+
+def _fmt_min(sec):
+    m = sec / 60
+    return f"约 {m:.0f} 分钟" if m >= 1.5 else "约 1 分钟"
+
+
+def estimate(n, args):
+    """估算两种拆法的耗时，供拆分前让用户选择。"""
+    try:
+        import onnxruntime as ort
+        gpu = "CUDAExecutionProvider" in ort.get_available_providers()
+    except ImportError:
+        gpu = False
+    base = n * (SEC_SPLIT + (SEC_SR if args.upscale > 1 else 0))
+    refine = "birefnet-lite"
+    fine = base + n * SEC_REFINE[refine]
+    note = "检测到显卡，实际会比估算快很多" if gpu else "没有显卡，按 CPU 估算"
+    return {
+        "elements": n, "gpu": gpu, "note": note,
+        "options": [
+            {"name": "标准", "args": "", "minutes": round(base / 60, 1), "time": _fmt_min(base),
+             "desc": "SAM 分割，速度快；平涂插画的轮廓外可能带 1 像素左右的浅色毛边"},
+            {"name": "精修", "args": f"--refine {refine}", "minutes": round(fine / 60, 1),
+             "time": _fmt_min(fine),
+             "desc": "在标准基础上用 BiRefNet 重新判定边缘一圈，毛边和底色光晕更少；"
+                     f"每个元素多约 {SEC_REFINE[refine]:.0f} 秒，内存需要约 7GB"},
+        ],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="图层拆分 / 造景贴纸")
     ap.add_argument("image")
@@ -827,6 +862,8 @@ def main():
                     help="仅配合 --sticker：白边宽度(px)，0 表示自动（默认）")
     ap.add_argument("--min-size", type=int, default=24, help="输出元素的最小边长")
     ap.add_argument("--zip", action="store_true", help="结果打包成 <out>.zip")
+    ap.add_argument("--estimate", action="store_true",
+                    help="不拆，只估算“标准”和“精修”两种拆法的耗时，给用户选")
     args = ap.parse_args()
 
     img = Image.open(args.image)
@@ -859,6 +896,10 @@ def main():
             name = "".join(c for c in str(d.get("name") or f"item{i:03d}")
                            if c.isalnum() or c in "-_ ").strip().replace(" ", "_") or f"item{i:03d}"
             jobs.append((name, bx, None, {"points": d.get("points"), "neg": d.get("neg")}))
+
+    if args.estimate:
+        print(json.dumps(estimate(len(jobs), args), ensure_ascii=False, indent=1))
+        return
 
     sam = None
     hires = not args.no_hires

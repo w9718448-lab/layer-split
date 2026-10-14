@@ -54,13 +54,26 @@ python3 -I scripts/grid_overlay.py 原图.png grid.png --step 50 --region x0,y0,
 `points` 是落在目标上的正点，`neg` 是落在不要的东西上的负点（原图坐标），用来纠正选错、粘连。名称不要重复。
 
 ### 2. 拆分（元素多时放后台跑）
+
+**先让用户选拆法，再正式拆。** 框列好后先估算耗时：
 ```
-nohup python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json > run.log 2>&1 &
+python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json --estimate
+```
+把输出里的两个选项原样告诉用户，标上元素个数和估算时间，等用户选：
+- **标准**：速度快，平涂插画的轮廓外可能带 1 像素左右的浅色毛边
+- **精修**（`--refine birefnet-lite`）：毛边和底色光晕更少，每个元素多约 30 秒，内存约 7GB
+
+例：“共 120 个元素。标准约 15 分钟；精修约 75 分钟，边缘更干净。选哪个？”
+估算按无显卡的 CPU 计（`note` 会说明是否检测到显卡），是上限。用户已经说过要哪种的，直接按那种拆，不用再问。
+
+然后按选的拆：
+```
+nohup python3 -I scripts/split_layers.py 原图.png --out 输出目录 --mode boxes --boxes boxes.json [--refine birefnet-lite] > run.log 2>&1 &
 ```
 看 `review_these.png` 和 `sheet_elements_N.png`，选错的元素加 `neg`/`points` 重跑；只剩碎片的元素删掉。
-框都对了以后，想要更干净的边缘（细线、毛边、半透明边不带底色光晕）可以加 `--refine birefnet-lite` 正式拆一遍。
-它只重新判定 SAM 掩码边缘一圈的像素，内部和框外不动；BiRefNet 认不出这个元素时自动退回 SAM 结果
-（`manifest.json` 里 `quality.refined` 记录是否精修过）。CPU 上每个元素多 30 秒左右、内存约 7GB，有显卡会快很多。
+用户选了精修时，可以先用标准（或 `--no-hires`）快速拆一遍确认框都对，再加 `--refine` 正式拆，免得精修跑完才发现框错了。
+精修只重新判定 SAM 掩码边缘一圈的像素，内部和框外不动；BiRefNet 认不出这个元素时自动退回 SAM 结果
+（`manifest.json` 里 `quality.refined` 记录是否精修过）。
 背景简单、元素分得开的图（纯色或渐变底）可以直接 `--mode auto`，不用列框。
 
 ### 3. 补全（必做）
@@ -123,6 +136,7 @@ python3 -I scripts/build_psd.py 原图.png --run 输出目录 --out 结果.psd
 | `split_layers.py --no-exclusive` | 关 | 不做像素归属（默认重叠像素归更小的元素） |
 | `split_layers.py --sticker` | 关 | 额外出白边贴纸版，用户明确要才加 |
 | `split_layers.py --refine` | none | `birefnet-lite` / `birefnet`：用 BiRefNet 精修边缘 |
+| `split_layers.py --estimate` | 关 | 不拆，只估算标准 / 精修两种拆法的耗时 |
 | `complete.py api --backend` | — | `gemini` / `openai` / `fal`：脚本直接调生图 API 补全 |
 | `complete.py --pack` | 4 | 几个元素拼一张图交给生图模型 |
 | `complete.py --min-hole` | 0.03 | 缺口占比低于此值不补 |
