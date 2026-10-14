@@ -11,7 +11,8 @@
 ## 安装
 
 ```bash
-git clone https://github.com/<你的用户名>/layer-split.git
+git clone https://github.com/w9718448-lab/layer-split.git
+# 仓库是私有的，需要先登录 GitHub（gh auth login 或配置 token）
 pip install -r layer-split/requirements.txt
 # 没有生图模型、需要本地补全时再装：pip install torch
 ```
